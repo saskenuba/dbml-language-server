@@ -1,0 +1,3 @@
+[submodule "tree-sitter-dbml"]
+	path = tree-sitter-dbml
+	url = https://github.com/saskenuba/tree-sitter-dbml
