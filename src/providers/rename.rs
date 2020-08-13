@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::{
     file::parse_file,
+    find_location_on_ast, populate_identifiers,
     wrappers::{Point, Range},
     LANGUAGE,
 };
@@ -58,6 +59,11 @@ pub fn rename(
     let papi = current_node.parent().unwrap();
 
     // TODO: Set rule by finding from where we are renaming
+
+    let wat = populate_identifiers(source.as_ref(), root_node);
+
+    println!("all fields: {:?}", wat);
+    find_location_on_ast(source.as_ref(), root_node, edit_position);
 
     // println!("rules");
     // let oi = table_rename_rules(&source, root_node, current_node_value, &|c: Node| {

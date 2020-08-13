@@ -1,8 +1,7 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use log::info;
-
-use dbml_language_server::file::open_and_parse;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp::{
     lsp_types::{
@@ -14,16 +13,46 @@ use tower_lsp::{
     },
     Client, LanguageServer, LspService, Server,
 };
+use tree_sitter::Tree;
 
-#[derive(Debug, Default)]
+use dbml_language_server::{
+    file::{parse_file, read_file},
+    populate_identifiers, IdentifiersMap,
+};
+
+#[derive(Debug)]
 struct Backend {
-    last_complete_text: Arc<Mutex<String>>,
+    client: Client,
+    raw_source_code: Arc<Mutex<String>>,
+    parsed_source_code: Arc<Mutex<Option<Tree>>>,
+    identifier_list: Arc<Mutex<IdentifiersMap>>,
 }
 
 impl Backend {
-    async fn update_last_text(&self, text_to_update: String) {
-        let mut inner_last_text = self.last_complete_text.lock().await;
-        *inner_last_text = text_to_update;
+    async fn update_source_code_and_parse(&self, text_to_update: String) -> Result<()> {
+        let mut inner_last_text = self.raw_source_code.lock().await;
+        *inner_last_text = text_to_update.clone();
+
+        let mut inner_parsed_code = self.parsed_source_code.lock().await;
+        let tree = parse_file(text_to_update.as_bytes(), None);
+        *inner_parsed_code = tree;
+
+        Ok(())
+    }
+
+    async fn populate_identifier_map(&self) -> Result<()> {
+        let source = self.raw_source_code.lock().await;
+        let parsed_code = self
+            .parsed_source_code
+            .lock()
+            .await
+            .as_ref()
+            .map(|tree| populate_identifiers(source.as_bytes(), tree.root_node()));
+
+        let mut afds = self.identifier_list.lock().await;
+        *afds = parsed_code.unwrap();
+
+        Ok(())
     }
 }
 
@@ -31,13 +60,12 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(
         &self,
-        _: &Client,
         _: InitializeParams,
     ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
         // Request full content each change
         let text_sync_kind = TextDocumentSyncKind::Full;
         // Trigger completion automatically on dot
-        let completion_characters = vec![".".to_string()];
+        let completion_characters = vec![".".to_string(), "[".to_string()];
 
         let initialize = InitializeResult {
             capabilities: ServerCapabilities {
@@ -56,8 +84,9 @@ impl LanguageServer for Backend {
         Ok(initialize)
     }
 
-    async fn initialized(&self, client: &Client, _: InitializedParams) {
-        client.log_message(MessageType::Info, "server initialized!");
+    async fn initialized(&self, _: InitializedParams) {
+        self.client
+            .log_message(MessageType::Info, "server initialized!");
     }
 
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
@@ -65,25 +94,32 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
-    async fn did_open(&self, client: &Client, params: DidOpenTextDocumentParams) {
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        let teste = open_and_parse(&document.uri, None).unwrap().unwrap();
-        client.log_message(MessageType::Log, teste.root_node().to_sexp());
+
+        read_file(&document.uri).map(|file_bytes| async {
+            let file_content = String::from_utf8(file_bytes).unwrap();
+            self.update_source_code_and_parse(file_content).await;
+        });
+
+        self.client
+            .log_message(MessageType::Log, "Opened file sucessfully.");
     }
 
-    async fn did_change(&self, client: &Client, mut params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
         info!("did_change event");
 
         let document = params.text_document;
         let changes = params.content_changes.remove(0).text;
-        self.update_last_text(changes).await;
+        self.update_source_code_and_parse(changes).await;
+        self.populate_identifier_map().await;
 
-        client.log_message(MessageType::Log, document.uri);
+        self.client.log_message(MessageType::Log, document.uri);
     }
-    async fn did_save(&self, client: &Client, params: DidSaveTextDocumentParams) {
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let document = params.text_document;
         info!("save request");
-        client.log_message(MessageType::Log, "basingao");
+        self.client.log_message(MessageType::Log, "basingao");
     }
 
     async fn completion(
@@ -92,13 +128,36 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         info!("completion parameters: {:#?}", params);
 
-        let test = "test".to_string();
-        let test_two = "test_two".to_string();
-        let simple = CompletionResponse::from(vec![
-            CompletionItem::new_simple(test.clone(), test),
-            CompletionItem::new_simple(test_two.clone(), test_two),
-        ]);
-        Ok(Some(simple))
+        let current_pos = params.text_document_position.position;
+        let context = params.context.unwrap();
+
+        let current_source_file = self.raw_source_code.lock().await.clone();
+        let current_tree = self.parsed_source_code.lock().await.clone();
+        let identifiers = self.identifier_list.lock().await;
+        info!("{:?}", identifiers);
+
+        if current_tree.is_none() {
+            return Ok(None);
+        }
+
+        let completions_available = dbml_language_server::providers::complete_at_point(
+            current_source_file,
+            current_tree.unwrap(), // Safe to unwrap after the early return
+            &identifiers,
+            current_pos,
+            context,
+        );
+
+        // if completions are available, we map them into a proper response
+        let completion_response = completions_available.map(|all_completions| {
+            let to_completion_items = all_completions
+                .iter()
+                .map(|each| CompletionItem::new_simple(each.to_string(), each.to_string()))
+                .collect::<Vec<CompletionItem>>();
+            CompletionResponse::from(to_completion_items)
+        });
+
+        Ok(completion_response)
     }
     async fn rename(
         &self,
@@ -108,7 +167,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri;
 
-        let current_source_file = self.last_complete_text.lock().await.clone();
+        let current_source_file = self.raw_source_code.lock().await.clone();
         info!("source: {:?}", current_source_file);
 
         Ok(dbml_language_server::providers::rename(
@@ -130,7 +189,12 @@ async fn main() -> Result<()> {
 
     info!("Starting generic LSP Server..");
 
-    let (service, messages) = LspService::new(Backend::default());
+    let (service, messages) = LspService::new(|client| Backend {
+        client,
+        raw_source_code: Arc::new(Default::default()),
+        parsed_source_code: Arc::new(Default::default()),
+        identifier_list: Default::default(),
+    });
 
     Server::new(read, write)
         .interleave(messages)

@@ -23,7 +23,7 @@ pub fn open_and_parse_with_source(
     read_file(file_path).map(|file_bytes| (parse_file(&file_bytes, old_tree), file_bytes))
 }
 
-fn read_file(file_uri: &Url) -> Result<Vec<u8>> {
+pub fn read_file(file_uri: &Url) -> Result<Vec<u8>> {
     let mut file_path = None;
 
     if !file_uri.origin().is_tuple() {
