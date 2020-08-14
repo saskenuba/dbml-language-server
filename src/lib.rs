@@ -16,11 +16,16 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
+use log::info;
 use once_cell::sync::Lazy;
 use tower_lsp::lsp_types::Position as LspPosition;
 use tree_sitter::{Language, Node, Parser, Query, QueryCapture, QueryCursor};
 
-use crate::wrappers::{Point, Range};
+use crate::{
+    navigation::node_parent_identifier,
+    wrappers::{Point, Range},
+};
+use navigation::search_valid_node;
 
 pub mod file;
 pub mod navigation;
@@ -43,6 +48,21 @@ pub static PARSER: Lazy<Mutex<Parser>> = Lazy::new(|| {
 pub struct IdentifiersMap {
     tables_with_fields: HashMap<String, Vec<FieldInfo>>,
     enums_without_discriminants: Vec<String>,
+}
+
+impl IdentifiersMap {
+    fn tables(&self) -> Option<Vec<String>> {
+        Some(
+            self.tables_with_fields
+                .keys()
+                .map(|keys| keys.to_string())
+                .collect::<Vec<String>>(),
+        )
+    }
+
+    fn fields_of_table(&self, table_name: &str) -> Option<Vec<FieldInfo>> {
+        Some(self.tables_with_fields.get_key_value(table_name)?.1.clone())
+    }
 }
 
 #[derive(Debug, Default, Eq, PartialEq, Clone)]
@@ -101,10 +121,8 @@ fn populate_table_identifiers(
     let field_nodes = query_for_nodes(&mut query_field_cursor, source, root_node, &fields_query);
 
     for node in field_nodes {
-        let table_name =
-            navigation::node_parent_identifier(source, &node, "table_definition", "name").unwrap();
-        let table_alias =
-            navigation::node_parent_identifier(source, &node, "table_definition", "alias");
+        let table_name = node_parent_identifier(source, &node, "table_definition", "name").unwrap();
+        let table_alias = node_parent_identifier(source, &node, "table_definition", "alias");
         let field_range = node.range();
         let field_name = node.utf8_text(source).unwrap();
         let field_type = node.next_sibling().unwrap().utf8_text(source).unwrap();
@@ -163,16 +181,6 @@ fn find_location_on_ast(
     let current_node_kind = current_node.kind();
     let parent_kind = current_node.parent().map(|c| c.kind());
 
-    match current_node_kind {
-        "field_attribute_list" => return CursorLocation::FieldAttributeList,
-        _ => {}
-    }
-
-    match parent_kind {
-        Some("field_declaration_list" | "table_definition") => return CursorLocation::Field,
-        _ => {}
-    }
-
     println!("root node: {:?}", root_node);
     println!("current_node: {:?}", current_pos);
     println!(
@@ -194,15 +202,27 @@ fn find_location_on_ast(
     println!("is error?, {:?}", root_node.is_error());
     println!("is missing?, {:?}", root_node.is_missing());
 
+    if let "field_attribute_list" = current_node_kind {
+        let new_node = search_valid_node(current_pos, root_node, "field_declaration_list");
+        info!("{:?}", new_node);
+        return CursorLocation::FieldAttributeList;
+    }
+
+    match parent_kind {
+        Some("field_declaration_list" | "table_definition") => return CursorLocation::Field,
+        _ => {}
+    }
+
     // beyond this we have top level
     if current_node.kind() != "project_file" && current_node.kind() != "field_declaration_list" {
         return CursorLocation::Unknown;
     }
 
-    println!("----");
+    println!("---- Searching for valid node.. ----");
 
-    let current_node = navigation::search_valid_node(current_pos, root_node);
-    println!("{:?}", current_pos);
+    let current_node = search_valid_node(current_pos, root_node, "project_file");
+    let current_node_kind = current_node.map(|c| c.kind());
+    let parent_kind = current_node.map(|c| c.parent()).flatten().map(|c| c.kind());
 
     println!("current_node: {:?}", current_pos);
     println!(
@@ -221,11 +241,24 @@ fn find_location_on_ast(
         current_node.map(|c| c.parent().map(|c| c.kind()))
     );
 
+    if let Some(node) = current_node {
+        let node_text = node.utf8_text(source).unwrap();
+
+        if node_text == ":" || parent_kind == Some("cardinality_op") {
+            return CursorLocation::TableField_Table;
+        }
+        if node_text == "." {
+            let table = node.prev_sibling().unwrap().utf8_text(source).unwrap();
+            println!("table_name from tablefield {:?}", table);
+            return CursorLocation::TableField_Field(table.to_string());
+        }
+    }
+
     CursorLocation::Unknown
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Eq, PartialEq, Copy, Clone)]
+#[derive(Eq, PartialEq, Clone)]
 enum CursorLocation {
     Unknown,
     Table,
@@ -237,5 +270,5 @@ enum CursorLocation {
     Enum,
     /// We are inside a relationship
     TableField_Table,
-    TableField_Field,
+    TableField_Field(String),
 }

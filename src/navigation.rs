@@ -4,14 +4,19 @@ use tree_sitter::Node;
 
 /// If current node found is the topmost one, naively searches for another node by subtracting
 /// columns until 0.
-pub(crate) fn search_valid_node(current_point: Point, root_node: Node) -> Option<Node> {
+pub(crate) fn search_valid_node<'a>(
+    mut current_point: Point,
+    root_node: Node<'a>,
+    node_kind: &'a str,
+) -> Option<Node<'a>> {
     while let Some(descendant_node) =
         root_node.descendant_for_point_range(*current_point, *current_point)
     {
-        current_point.column.checked_sub(1)?;
+        // FIXME: Should decrease row after column reaches 0, and go on recursively
+        current_point.column = current_point.column.checked_sub(1)?;
         debug!("searching on: {:?}", current_point);
 
-        if descendant_node.kind() != "project_file" {
+        if descendant_node.kind() != node_kind {
             return Some(descendant_node);
         }
     }

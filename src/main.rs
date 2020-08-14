@@ -96,11 +96,7 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-
-        read_file(&document.uri).map(|file_bytes| async {
-            let file_content = String::from_utf8(file_bytes).unwrap();
-            self.update_source_code_and_parse(file_content).await;
-        });
+        self.update_source_code_and_parse(document.text).await.ok();
 
         self.client
             .log_message(MessageType::Log, "Opened file sucessfully.");

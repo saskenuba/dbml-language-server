@@ -19,6 +19,21 @@ pub fn complete_at_point(
 
     let valid_position = find_location_on_ast(source.as_bytes(), root_node, edit_position);
 
+    if CursorLocation::TableField_Table == valid_position {
+        let tables_identifiers = identifiers.tables()?;
+        return Some(tables_identifiers);
+    }
+
+    if let CursorLocation::TableField_Field(table_name) = valid_position {
+        let fields = identifiers.fields_of_table(&table_name)?;
+        return Some(
+            fields
+                .iter()
+                .map(|field| field.text_name.to_owned())
+                .collect(),
+        );
+    }
+
     // dentro de tabelas
 
     // caso estiver dentro de um field_declaration_list
